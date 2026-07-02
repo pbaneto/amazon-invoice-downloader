@@ -44,6 +44,7 @@ Credential Precedence:
 
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime
@@ -51,10 +52,30 @@ from pathlib import Path
 
 from docopt import docopt
 from dotenv import load_dotenv
-from playwright.sync_api import TimeoutError, sync_playwright
+from playwright.sync_api import Error, sync_playwright
 from playwright_stealth import Stealth
 
 from ..__about__ import __version__
+
+BASE_URL = "https://www.amazon.es"
+SPANISH_MONTHS = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+
+
+def parse_spanish_date(card_text: str) -> datetime:
+    # First date in the card is the order date, e.g. "24 de junio de 2026".
+    match = re.search(r"(\d{1,2}) de (\w+) de (\d{4})", card_text)
+    day, month_name, year = int(match.group(1)), match.group(2).lower(), int(match.group(3))
+    return datetime(year, SPANISH_MONTHS[month_name], day)
+
+
+def parse_euro_total(card_text: str) -> str:
+    # e.g. "TOTAL\n1.234,56 €" -> "1234.56" (European thousands '.', decimal ',')
+    match = re.search(r"TOTAL\s*([\d.,]+)", card_text)
+    amount = match.group(1) if match else "0"
+    return amount.replace(".", "").replace(",", ".")
 
 
 def load_env_if_needed():
@@ -140,6 +161,10 @@ def run(playwright, args):
 
     # Create context and page
     context = browser.new_context()
+    # Bound every operation so a stalled page (e.g. an ad iframe that never goes
+    # idle) surfaces as a timeout instead of hanging the whole run indefinitely.
+    context.set_default_timeout(60000)
+    context.set_default_navigation_timeout(60000)
     page = context.new_page()
 
     # Set up virtual authenticator to prevent passkey dialogs
@@ -166,43 +191,80 @@ def run(playwright, args):
 
     Stealth().apply_stealth_sync(page)
 
-    # Wait for page to fully load
-    page.goto("https://amazon.com/")
-    page.wait_for_load_state("domcontentloaded")
-
-    # Check if we're on the less fully featured page
-    test_less_featured_page = page.query_selector('a:has-text("Returns & Orders")')
-    if not test_less_featured_page:
-        print("Less featured page detected, navigating to sign-in...")
-        page.query_selector('a:has-text("Your Account")').click()
+    # Amazon intermittently serves an anti-bot "Seguir comprando" interstitial or a
+    # stripped-down page instead of the full homepage. Retry loading until the
+    # account/sign-in link is present, dismissing the interstitial each time.
+    sign_in_link = None
+    for attempt in range(5):
+        page.goto(BASE_URL + "/", wait_until="domcontentloaded")
         page.wait_for_load_state("domcontentloaded")
+
+        continue_button = page.query_selector(
+            'button:has-text("Seguir comprando"), input[value="Seguir comprando"], '
+            'button:has-text("Continue shopping"), input[value="Continue shopping"]'
+        )
+        if continue_button:
+            print("Dismissing anti-bot interstitial...")
+            continue_button.click()
+            page.wait_for_load_state("domcontentloaded")
+            sleep()
+
+        sign_in_link = page.query_selector('#nav-link-accountList')
+        if sign_in_link:
+            break
+        print(f"Homepage sign-in link not found, retrying ({attempt + 1}/5)...")
         sleep()
 
-    page.query_selector('a:has-text("Hello, sign in")').click()
+    if not sign_in_link:
+        raise RuntimeError("Could not reach the Amazon homepage sign-in link after several attempts")
+
+    sign_in_link.click()
     page.wait_for_load_state("domcontentloaded")
     sleep()
 
+    # The login form field ids are stable across locales.
     if email:
-        page.get_by_label("Email").fill(email)
-        page.get_by_role("button", name="Continue").click()
-        page.wait_for_load_state("domcontentloaded")
-        sleep()
+        page.fill('#ap_email_login' if page.query_selector('#ap_email_login') else '#ap_email', email)
+        continue_button = page.query_selector('#continue')
+        if continue_button:
+            continue_button.click()
+            page.wait_for_load_state("domcontentloaded")
+            sleep()
 
     if password:
-        page.get_by_label("Password").fill(password)
-        page.get_by_role("button", name="Sign in", exact=True).click()
+        page.fill('#ap_password', password)
+        page.click('#signInSubmit')
         page.wait_for_load_state("domcontentloaded")
         sleep()
 
-    # Check for 2FA page
-    if page.query_selector('title:has-text("Two-Step Verification")'):
+    # After the password, Amazon may redirect to a Two-Step Verification (OTP) page.
+    # The redirect can still be in flight and destroy the DOM context mid-query, so
+    # settle the page and tolerate that transient error before/while checking.
+    def on_2fa_page():
+        for _ in range(3):
+            try:
+                page.wait_for_load_state("domcontentloaded")
+                title = page.title()
+                return (
+                    "Two-Step Verification" in title
+                    or "Verificación en dos pasos" in title
+                    or bool(page.query_selector('input#auth-mfa-otpcode'))
+                )
+            except Error:
+                time.sleep(1)
+        return False
+
+    if on_2fa_page():
         print("🔐 2FA detected - please complete authentication in browser")
-        while page.query_selector('title:has-text("Two-Step Verification")'):
+        while on_2fa_page():
             time.sleep(1)
         print("✅ 2FA completed")
     page.wait_for_load_state("domcontentloaded")
 
-    page.wait_for_selector("a >> text=Returns & Orders", timeout=0).click()
+    # Navigate straight to the order history (locale-independent URL)
+    page.goto(BASE_URL + "/gp/css/order-history?ref_=nav_orders_first", wait_until="domcontentloaded")
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_selector("select#time-filter", timeout=60000)
     sleep()
 
     # Get a list of years from the select options
@@ -215,46 +277,52 @@ def run(playwright, args):
     # Filter years to the include only the years between start_date and end_date inclusively
     years = [year for year in years if start_date.year <= int(year) <= end_date.year]
     years.sort(reverse=True)
+    print(f"Order-history years available in range: {years}")
 
     # Year Loop (Run backwards through the time range from years to pages to orders)
     for year in years:
-        # Select the year in the order filter
-        page.select_option('form[action="/your-orders/orders"] select#time-filter', value=f"year-{year}")
+        # Select the year in the order filter; retry once if the reload stalls.
+        for attempt in range(2):
+            try:
+                page.select_option("select#time-filter", value=f"year-{year}")
+                page.wait_for_selector(".order-card.js-order-card", timeout=30000)
+                break
+            except Error:
+                print(f"Year {year} filter stalled, reloading order history...")
+                page.goto(BASE_URL + "/gp/css/order-history?ref_=nav_orders_first", wait_until="domcontentloaded")
+                page.wait_for_load_state("domcontentloaded")
         sleep()
 
         # Page Loop
         first_page = True
         done = False
         while not done:
-            # Go to the next page pagination, and continue downloading
-            #   if there is not a next page then break
-            try:
-                if first_page:
-                    first_page = False
-                else:
-                    page.get_by_role("link", name="Next →").click()
-                sleep()  # sleep after every page load
-            except TimeoutError:
-                # There are no more pages
-                break
+            # Follow the pagination "next" control (locale-independent .a-last class);
+            # if it is missing or disabled there are no more pages.
+            if not first_page:
+                next_link = page.query_selector("ul.a-pagination li.a-last:not(.a-disabled) a")
+                if not next_link:
+                    break
+                next_link.click()
+                page.wait_for_load_state("domcontentloaded")
+            first_page = False
+            sleep()
 
             # Order Loop
             order_cards = page.query_selector_all(".order-card.js-order-card")
             for order_card in order_cards:
-                # Parse the order card to create the date and file_name
-                spans = order_card.query_selector_all("span")
-                # Debug:
-                # for i,s in enumerate(spans): print(i, s.inner_text())
+                card_text = order_card.inner_text()
 
                 # Skip cancelled orders
-                if spans[4].inner_text().strip().lower() == "cancelled":
+                if "cancelado" in card_text.lower():
                     continue
 
-                date = datetime.strptime(spans[1].inner_text(), "%B %d, %Y")
-                total = spans[3].inner_text().replace("$", "").replace(",", "")  # remove dollar sign and commas
-                orderid = spans[8].inner_text()
+                date = parse_spanish_date(card_text)
+                total = parse_euro_total(card_text)
+                details = order_card.query_selector('a[href*="orderID="]')
+                orderid = re.search(r"orderID=([0-9-]+)", details.get_attribute("href")).group(1)
                 date_str = date.strftime("%Y%m%d")
-                file_name = f"{target_dir}/{date_str}_{total}_amazon_{orderid}.pdf"
+                base_name = f"{target_dir}/{date_str}_{total}_amazon_{orderid}"
 
                 if date > end_date:
                     continue
@@ -262,22 +330,34 @@ def run(playwright, args):
                     done = True
                     break
 
-                if os.path.isfile(file_name):
-                    print(f"File [{file_name}] already exists")
-                else:
-                    print(f"Saving file [{file_name}]")
-                    # Save
-                    link = "https://www.amazon.com/" + order_card.query_selector(
-                        'xpath=//a[contains(text(), "View invoice")]'
-                    ).get_attribute("href")
-                    invoice_page = context.new_page()
-                    invoice_page.goto(link)
-                    invoice_page.pdf(
-                        path=file_name,
-                        format="Letter",
-                        margin={"top": ".5in", "right": ".5in", "bottom": ".5in", "left": ".5in"},
-                    )
-                    invoice_page.close()
+                # Open the order's "Factura" popover and download the real invoice
+                # PDF(s). Orders where the seller has not issued one only offer
+                # "Solicitar factura" and are skipped.
+                trigger = order_card.query_selector('a[href*="invoice/popover"]')
+                if not trigger:
+                    print(f"⚠️ No invoice option for {orderid}; skipping")
+                    continue
+                popover_html = context.request.get(BASE_URL + trigger.get_attribute("href")).text()
+                anchors = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', popover_html, re.S)
+                factura_hrefs = [
+                    href for href, text in anchors if re.sub(r"<[^>]*>", "", text).strip().startswith("Factura")
+                ]
+                if not factura_hrefs:
+                    print(f"⚠️ No factura available for {orderid} (only 'Solicitar factura'); skipping")
+                    continue
+
+                for index, href in enumerate(factura_hrefs):
+                    file_name = f"{base_name}.pdf" if len(factura_hrefs) == 1 else f"{base_name}_{index + 1}.pdf"
+                    if os.path.isfile(file_name):
+                        print(f"File [{file_name}] already exists")
+                        continue
+                    print(f"Saving invoice [{file_name}]")
+                    try:
+                        response = context.request.get(BASE_URL + href)
+                        with open(file_name, "wb") as invoice_file:
+                            invoice_file.write(response.body())
+                    except Error as exc:
+                        print(f"⚠️ Skipped invoice for {orderid}: {exc}")
 
     # Close the browser
     context.close()
